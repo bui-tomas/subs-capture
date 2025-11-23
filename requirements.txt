@@ -1,0 +1,5 @@
+playwright
+paddleocr
+pypinyin
+opencv-python
+numpy
