@@ -1,10 +1,15 @@
 import asyncio
 import cv2
 import numpy as np
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Page, ElementHandle
 from paddleocr import PaddleOCR
 from pypinyin import lazy_pinyin, Style
 import json
+import re
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 AD_OFFSET = 18.8
 
@@ -17,66 +22,105 @@ class SubtitleExtractor:
         self.subtitles = []
         self.url = url
         self.subs_path = subs_path
-        self.subtitle_region = None  # Will be set dynamically
 
-    async def show_sub_overlay(self, page, video):
+        self.video_width = None
+        self.video_height = None
+        self.subtitle_region = None 
+        self.left_lyrics_region = None
+        self.right_lyrics_region = None
+
+    async def set_dimensions(self, video: ElementHandle):
+        screenshot = await video.screenshot()
+
+        if self.video_width is None:
+            nparr = np.frombuffer(screenshot, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            self.video_height, self.video_width = img.shape[:2]
+
+        h, w = self.video_height, self.video_width
+
+        self.subtitle_region = (int(h * 0.75), int(h * 0.85), int(w * 0.25), int(w * 0.75))
+        self.left_lyrics_region = (int(h * 0.2), int(h * 0.7), int(w * 0.05), int(w * 0.15))
+        self.right_lyrics_region = (int(h * 0.2), int(h * 0.7), int(w * 0.85), int(w * 0.95))
+
+    async def show_overlay(self, page: Page, video: ElementHandle):
         '''
         Draws a yellow border around detected subtitle region
         '''
-        screenshot = await video.screenshot()
-        self.subtitle_region = self.detect_sub_region(screenshot)
-        y1, y2, x1, x2 = self.subtitle_region
-        
+
         # Get video position on page
         box = await video.bounding_box()
+
+        y1, y2, x1, x2 = self.subtitle_region
+        ly1, ly2, lx1, lx2 = self.left_lyrics_region
+        ry1, ry2, rx1, rx2 = self.right_lyrics_region
         
         # Inject overlay div
         await page.evaluate(f'''
-            const overlay = document.createElement('div');
-            overlay.id = 'subtitle-debug-overlay';
-            overlay.style.cssText = `
-                position: fixed;
-                left: {box['x'] + x1}px;
-                top: {box['y'] + y1}px;
-                width: {x2 - x1}px;
-                height: {y2 - y1}px;
-                border: 3px solid yellow;
-                background: rgba(255, 255, 0, 0.1);
-                pointer-events: none;
-                z-index: 99999;
-            `;
-            document.body.appendChild(overlay);
-        ''')
-        
-        print(f'Overlay shown. Region: y={y1}-{y2}, x={x1}-{x2}')
-
-    def detect_sub_region(self, screenshot_bytes):
-        '''
-        Detect the subtitle region from a sample frame
-        Returns (y_start, y_end, x_start, x_end)
-        '''
-        nparr = np.frombuffer(screenshot_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        height, width = img.shape[:2]
-        
-        # Usually bottom 20-30% of video
-        y_start = int(height * 0.75)
-        y_end = int(height * 0.85)
-        x_start = int(width * 0.25)
-        x_end = int(width * 0.75)
-        
-        return (y_start, y_end, x_start, x_end)
+                // Subtitle overlay (yellow)
+                const overlay = document.createElement('div');
+                overlay.id = 'subtitle-debug-overlay';
+                overlay.style.cssText = `
+                    position: fixed;
+                    left: {box['x'] + x1}px;
+                    top: {box['y'] + y1}px;
+                    width: {x2 - x1}px;
+                    height: {y2 - y1}px;
+                    border: 3px solid yellow;
+                    background: rgba(255, 255, 0, 0.1);
+                    pointer-events: none;
+                    z-index: 99999;
+                `;
+                document.body.appendChild(overlay);
+                
+                // Left lyrics overlay (blue)
+                const leftLyrics = document.createElement('div');
+                leftLyrics.id = 'left-lyrics-overlay';
+                leftLyrics.style.cssText = `
+                    position: fixed;
+                    left: {box['x'] + lx1}px;
+                    top: {box['y'] + ly1}px;
+                    width: {lx2 - lx1}px;
+                    height: {ly2 - ly1}px;
+                    border: 3px solid blue;
+                    background: rgba(0, 0, 255, 0.1);
+                    pointer-events: none;
+                    z-index: 99999;
+                `;
+                document.body.appendChild(leftLyrics);
+                
+                // Right lyrics overlay (green)
+                const rightLyrics = document.createElement('div');
+                rightLyrics.id = 'right-lyrics-overlay';
+                rightLyrics.style.cssText = `
+                    position: fixed;
+                    left: {box['x'] + rx1}px;
+                    top: {box['y'] + ry1}px;
+                    width: {rx2 - rx1}px;
+                    height: {ry2 - ry1}px;
+                    border: 3px solid green;
+                    background: rgba(0, 255, 0, 0.1);
+                    pointer-events: none;
+                    z-index: 99999;
+                `;
+                document.body.appendChild(rightLyrics);
+            ''')
 
     def load_subs(self, file_path: str, time_offset=0):
         '''
         Loads subtitles from JSON file and apply time offset
         Args:
-            json_file_path: path to JSON file with subtitles
+            file_path: path to JSON file with subtitles
             time_offset: seconds to subtract from all timestamps
         Returns:
             List of subtitle dicts with adjusted timestamps
         '''
+        def is_lyrics(text: str) -> bool:
+            return '♪' in text
+        
+        def is_long(start: float, end: float) -> bool:
+            return start + end > 2.0
+
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
@@ -88,12 +132,18 @@ class SubtitleExtractor:
                 subtitles.append({
                     'start': sub['start'] + time_offset,
                     'end': sub['end'] + time_offset,
+                    'duration': sub['end'] - sub['start'],
+                    'is_lyrics': is_lyrics(sub['text']),
+                    'is_long': is_long(sub['start'], sub['end']),
                     'text': sub['text']
                 })
             else:
                 subtitles.append({
                     'start': sub['start'],
                     'end': sub['end'],
+                    'duration': sub['end'] - sub['start'],
+                    'is_lyrics': is_lyrics(sub['text']),
+                    'is_long': is_long(sub['start'], sub['end']),
                     'text': sub['text']
                 })
 
@@ -102,21 +152,30 @@ class SubtitleExtractor:
         
         return subtitles
 
-    async def collect_screenshots(self, video, subtitles):
+    async def collect_screenshots(self, video: ElementHandle, subtitles: list[dict]):
         '''
         Single-pass screenshot collection with 6 samples per subtitle window
         '''
+        def get_offset(duration: float, is_lyrics=False, num_steps=3, overlap=0.9) -> list[float]:
+            if is_lyrics:
+                arr = np.linspace(0, duration / 2, (num_steps * 2))[1:-1]
+                offsets = [0]
+                offsets.extend([-val for val in arr])
+            else:
+                arr = np.linspace(0, duration, num_steps + 1)[1:]
+                arr[-1] *= overlap
+                offsets = [0]
+                offsets.extend([x for val in arr for x in (val, -val)])
+            return offsets
+        
         screenshots = {}
-        
-        # Offset range: 18.5 to 20.5 (6 equal parts = 0.4 second intervals)
-        offset_range = [0, -0.1, +0.1, -0.2, +0.2, -0.4, +0.4 -0.6, +0.6]
-        
-        print(f'\n📸 Collecting screenshots with multi-offset sampling...')
-        
+
         for idx, sub in enumerate(subtitles):
+            # Dynamic offset range  
+            offsets = get_offset[sub['duration'], sub['is_lyrics']]
             found = False
             
-            for offset in offset_range:
+            for offset in offsets:
                 timestamp = (sub['start'] + sub['end']) / 2  + offset
                 
                 await video.evaluate(f'v => v.currentTime = {timestamp}')
@@ -126,8 +185,8 @@ class SubtitleExtractor:
                 
                 # Try OCR - if we get Chinese text, we're done
                 cn_text = self.capture_cn_subs(screenshot)
-                
-                if cn_text and len(cn_text) >= 2:
+
+                if cn_text and len(cn_text) >= 1:
                     screenshots[idx] = (idx, cn_text)
                     print(f'  ✅ #{idx}: {cn_text[:20]}... (offset: {offset:+.1f}s) {sub['start']}')
                     found = True
@@ -143,21 +202,6 @@ class SubtitleExtractor:
         
         return valid_screenshots
 
-    def hash_subtitle_region(self, screenshot_bytes):
-        '''Quick hash of subtitle region to detect changes'''
-        nparr = np.frombuffer(screenshot_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        y1, y2, x1, x2 = self.subtitle_region
-        subtitle_img = img[y1:y2, x1:x2]
-        
-        # Simple perceptual hash
-        gray = cv2.cvtColor(subtitle_img, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (8, 8))
-        avg = resized.mean()
-        diff = resized > avg
-        return hash(diff.tobytes())
- 
     def capture_cn_subs(self, screenshot_bytes):
         '''
         Extract Chinese text from screenshot subtitle region via OCR
@@ -263,7 +307,11 @@ class SubtitleExtractor:
             
             print(f'\n📺 Opening: {self.url}')
             await page.goto(self.url, wait_until='networkidle')
-            await asyncio.sleep(2)  # Let page settle
+
+            # Find and click the button to turn off comments
+            button = await page.query_selector(os.getenv('BUTTON_SELECTOR'))
+            if button:
+                await button.click()
             
             video = await page.query_selector('#video_player')
             duration = await video.evaluate('v => v.duration')
@@ -271,7 +319,6 @@ class SubtitleExtractor:
             
             # Start playback
             await video.evaluate('v => v.play()')
-            await asyncio.sleep(2)
             
             # Wait for playback to start
             print('⏳ Waiting for playback to start...')
@@ -284,7 +331,8 @@ class SubtitleExtractor:
             print(f'✅ Playback started at {current_time:.1f}s')
             
             # Set subtitle region
-            await self.show_sub_overlay(page, video)
+            await self.set_dimensions(video)
+            await self.show_overlay(page, video)
             
             # Load subtitles
             print(f'\n📄 Loading subtitles from {self.subs_path}')
@@ -302,8 +350,8 @@ class SubtitleExtractor:
             await browser.close()          
                 
 async def main():
-    video_url = ''
-    subs_path = ''
+    video_url = os.getenv('VIDEO_URL')
+    subs_path = os.getenv('SUBS_PATH')
 
     extractor = SubtitleExtractor(video_url, subs_path)
     await extractor.extract()
