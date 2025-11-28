@@ -14,7 +14,7 @@ load_dotenv()
 AD_OFFSET = 18.8
 
 class SubtitleExtractor:
-    def __init__(self, url, subs_path):
+    def __init__(self, url: str, subs_path: str):
         self.ocr = PaddleOCR(
         use_textline_orientation=True,
         lang='ch',
@@ -168,41 +168,46 @@ class SubtitleExtractor:
                 offsets.extend([x for val in arr for x in (val, -val)])
             return offsets
         
-        screenshots = {}
+        screenshots = []
 
         for idx, sub in enumerate(subtitles):
             # Dynamic offset range  
-            offsets = get_offset[sub['duration'], sub['is_lyrics']]
-            found = False
-            
+            offsets = get_offset(sub['duration'], sub['is_lyrics'])
+
             for offset in offsets:
-                timestamp = (sub['start'] + sub['end']) / 2  + offset
+                timestamp = (sub['start'] + sub['end']) / 2 + offset
                 
                 await video.evaluate(f'v => v.currentTime = {timestamp}')
                 await asyncio.sleep(0.2)
                 
                 screenshot = await video.screenshot()
-                
-                # Try OCR - if we get Chinese text, we're done
-                cn_text = self.capture_cn_subs(screenshot)
-
-                if cn_text and len(cn_text) >= 1:
-                    screenshots[idx] = (idx, cn_text)
-                    print(f'  ✅ #{idx}: {cn_text[:20]}... (offset: {offset:+.1f}s) {sub['start']}')
-                    found = True
-                    break  # First match wins, move to next subtitle
+                screenshots.append((idx, sub, screenshot))
             
-            if not found:
-                print(f'  ❌ #{idx}: No text found')
-        
-        # Convert to sorted list
-        valid_screenshots = [screenshots[i] for i in sorted(screenshots.keys())]
-        
-        print(f'\n✅ Final: {len(valid_screenshots)}/{len(subtitles)} captured')
-        
-        return valid_screenshots
+            return screenshots 
 
-    def capture_cn_subs(self, screenshot_bytes):
+    async def process_screenshots(self, screenshots: tuple[int, dict, bytes]):
+        '''
+        Parallel OCR with semaphore to control concurrency
+        '''
+        semaphore = asyncio.Semaphore(5)  # 5 concurrent OCR tasks
+        
+        async def ocr_task(idx: int, sub, screenshot) -> tuple[int, str]:
+            async with semaphore:
+                # Run blocking OCR in executor
+                loop = asyncio.get_event_loop()
+                text = await loop.run_in_executor(
+                    None, 
+                    self.ocr_subs,
+                    sub, 
+                    screenshot
+                )
+                return (idx, text) 
+        
+        tasks = [ocr_task(idx, sub, ss) for idx, sub, ss in screenshots]  # ← Unpack 3 items
+        results = await asyncio.gather(*tasks)
+        return results
+
+    def ocr_subs(self, sub: dict, screenshot_bytes: bytes):
         '''
         Extract Chinese text from screenshot subtitle region via OCR
         '''
@@ -237,7 +242,7 @@ class SubtitleExtractor:
         
         return ''.join(filtered_texts) if filtered_texts else None
 
-    def process_and_save(self, ocr_results, subtitles, output_file='subtitles_cn.json'):
+    def process_and_save(self, ocr_results: str, subtitles: dict, output_file='subtitles_cn.json'):
         '''
         Convert Chinese text to pinyin and save final subtitle file
         '''
@@ -314,8 +319,6 @@ class SubtitleExtractor:
                 await button.click()
             
             video = await page.query_selector('#video_player')
-            duration = await video.evaluate('v => v.duration')
-            print(f'✅ Video duration: {duration:.1f}s ({duration/60:.1f} min)')
             
             # Start playback
             await video.evaluate('v => v.play()')
@@ -327,23 +330,20 @@ class SubtitleExtractor:
                 timeout=10000
             )
             
-            current_time = await video.evaluate('v => v.currentTime')
-            print(f'✅ Playback started at {current_time:.1f}s')
-            
             # Set subtitle region
             await self.set_dimensions(video)
-            await self.show_overlay(page, video)
+            # await self.show_overlay(page, video)
             
             # Load subtitles
             print(f'\n📄 Loading subtitles from {self.subs_path}')
             subtitles = self.load_subs(self.subs_path, time_offset=AD_OFFSET)
-            print(f'✅ Loaded {len(subtitles)} subtitle entries')
             
             # Collect screenshots
             print(f'\n📸 Collecting screenshots...')
             screenshots = await self.collect_screenshots(video, subtitles)
-            print(f'✅ Collected {len(screenshots)} screenshots')
             
+            
+
             # Save results
             self.process_and_save(screenshots, subtitles, output_file)
             
