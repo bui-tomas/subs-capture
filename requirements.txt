@@ -3,3 +3,8 @@ paddleocr
 pypinyin
 opencv-python
 numpy
+python-dotenv
+pandas
+numpy
+matplotlib
+tqdm

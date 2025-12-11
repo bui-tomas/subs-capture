@@ -1,27 +1,142 @@
+import json
+import re
+import os
 import asyncio
 import cv2
 import numpy as np
 from playwright.async_api import async_playwright, Page, ElementHandle
 from paddleocr import PaddleOCR
 from pypinyin import lazy_pinyin, Style
-import json
-import re
-import os
 from dotenv import load_dotenv
+from tqdm.asyncio import tqdm
+from concurrent.futures import ProcessPoolExecutor
 
 load_dotenv()
 
 AD_OFFSET = 18.8
+SKIP_SONGS = True
 
-class SubtitleExtractor:
-    def __init__(self, url: str, subs_path: str):
-        self.ocr = PaddleOCR(
+_worker_ocr = None
+_worker_regions = None
+
+def _init_worker(subtitle_region, left_lyrics_region, right_lyrics_region):
+    '''Initialize OCR once per worker process'''
+    global _worker_ocr, _worker_regions
+    _worker_ocr = PaddleOCR(
         use_textline_orientation=True,
         lang='ch',
     )
+    _worker_regions = {
+        'subtitle': subtitle_region,
+        'left_lyrics': left_lyrics_region,
+        'right_lyrics': right_lyrics_region
+    }
+
+def _ocr_subs(sub: dict, screenshot_list: list[tuple[float, bytes]], brightness_threshold: int = 210, similar_threshold: int = 100, pixel_threshold: int = 25) -> tuple[str, float]:
+    '''Worker function that uses global OCR instance'''
+    global _worker_ocr, _worker_regions
+    
+    ocr_results = []
+    all_scores = []
+    reference_grey = None
+    reference_has_text = False
+    
+    for offset, screenshot in screenshot_list:
+        nparr = np.frombuffer(screenshot, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # Extract appropriate region
+        if sub['is_lyrics']:
+            if sub['start'] < 120:
+                y1, y2, x1, x2 = _worker_regions['left_lyrics']
+            else:
+                y1, y2, x1, x2 = _worker_regions['right_lyrics']
+        else:
+            y1, y2, x1, x2 = _worker_regions['subtitle']
+        
+        subtitle_img = img[y1:y2, x1:x2]
+
+        # Apply brightness threshold filtering
+        if brightness_threshold:
+            subtitle_img = cv2.bitwise_and(
+                subtitle_img,
+                subtitle_img,
+                mask=cv2.inRange(
+                    subtitle_img,
+                    (brightness_threshold, brightness_threshold, brightness_threshold),
+                    (255, 255, 255)
+                )
+            )
+
+        # Convert to greyscale for similarity checking
+        grey = cv2.cvtColor(subtitle_img, cv2.COLOR_BGR2GRAY)
+        
+        # Set reference on first iteration
+        if reference_grey is None:
+            reference_grey = grey
+        else:
+            # Only do similarity check if reference had text
+            if reference_has_text:
+                _, absdiff = cv2.threshold(
+                    cv2.absdiff(reference_grey, grey),
+                    pixel_threshold,
+                    255,
+                    cv2.THRESH_BINARY
+                )
+                
+                if np.count_nonzero(absdiff) < similar_threshold:
+                    print(f"Skipping offset {offset:.2f}s - similar to reference")
+                    continue
+        
+        # Run OCR
+        result = _worker_ocr.predict(subtitle_img)
+        
+        if not result or len(result) == 0:
+            continue
+        
+        ocr_result = result[0]
+        texts = ocr_result['rec_texts']
+        conf_scores = ocr_result['rec_scores']
+        
+        if not texts:
+            continue
+        
+        # Mark that reference has text (first successful OCR)
+        if reference_grey is not None and not reference_has_text:
+            reference_has_text = True
+        
+        # Filter texts by confidence and collect scores
+        filtered_texts = []
+        for text, conf in zip(texts, conf_scores):
+            if conf > 0.7:
+                filtered_texts.append(text)
+                all_scores.append(conf)
+        
+        if filtered_texts:
+            combined_text = ''.join(filtered_texts)
+            ocr_results.append((offset, combined_text))
+    
+    if not ocr_results:
+        return '', 0.0
+    
+    ocr_results.sort(key=lambda x: x[0])
+    
+    # Deduplicate
+    unique_texts = []
+    seen = set()
+    for offset, text in ocr_results:
+        if text not in seen:
+            unique_texts.append(text)
+            seen.add(text)
+
+    return ''.join(unique_texts), np.mean(all_scores) if all_scores else 0.0
+
+class SubtitleExtractor:
+    def __init__(self, url: str, subs_path: str):
         self.subtitles = []
         self.url = url
         self.subs_path = subs_path
+        self.executor = None
 
         self.video_width = None
         self.video_height = None
@@ -39,9 +154,15 @@ class SubtitleExtractor:
 
         h, w = self.video_height, self.video_width
 
-        self.subtitle_region = (int(h * 0.75), int(h * 0.85), int(w * 0.25), int(w * 0.75))
-        self.left_lyrics_region = (int(h * 0.2), int(h * 0.7), int(w * 0.05), int(w * 0.15))
-        self.right_lyrics_region = (int(h * 0.2), int(h * 0.7), int(w * 0.85), int(w * 0.95))
+        self.subtitle_region = (int(h * 0.76), int(h * 0.83), int(w * 0.30), int(w * 0.70))
+        self.left_lyrics_region = (int(h * 0.2), int(h * 0.65), int(w * 0.05), int(w * 0.085))
+        self.right_lyrics_region = (int(h * 0.2), int(h * 0.65), int(w * 0.88), int(w * 0.93))
+
+        self.executor = ProcessPoolExecutor(
+            max_workers=5,
+            initializer=_init_worker,
+            initargs=(self.subtitle_region, self.left_lyrics_region, self.right_lyrics_region)
+        )
 
     async def show_overlay(self, page: Page, video: ElementHandle):
         '''
@@ -67,7 +188,6 @@ class SubtitleExtractor:
                     width: {x2 - x1}px;
                     height: {y2 - y1}px;
                     border: 3px solid yellow;
-                    background: rgba(255, 255, 0, 0.1);
                     pointer-events: none;
                     z-index: 99999;
                 `;
@@ -83,7 +203,6 @@ class SubtitleExtractor:
                     width: {lx2 - lx1}px;
                     height: {ly2 - ly1}px;
                     border: 3px solid blue;
-                    background: rgba(0, 0, 255, 0.1);
                     pointer-events: none;
                     z-index: 99999;
                 `;
@@ -99,7 +218,6 @@ class SubtitleExtractor:
                     width: {rx2 - rx1}px;
                     height: {ry2 - ry1}px;
                     border: 3px solid green;
-                    background: rgba(0, 255, 0, 0.1);
                     pointer-events: none;
                     z-index: 99999;
                 `;
@@ -152,109 +270,94 @@ class SubtitleExtractor:
         
         return subtitles
 
-    async def collect_screenshots(self, video: ElementHandle, subtitles: list[dict]):
+    async def collect_screenshots(self, 
+        video: ElementHandle, 
+        subtitles: list[dict]
+    ) -> list[tuple[int, dict, list[tuple[float, bytes]]]]:
         '''
         Single-pass screenshot collection with 6 samples per subtitle window
         '''
-        def get_offset(duration: float, is_lyrics=False, num_steps=3, overlap=0.9) -> list[float]:
+        def get_offset(duration: float, is_lyrics=False, num_steps=2, overlap=0.9) -> list[float]:
             if is_lyrics:
-                arr = np.linspace(0, duration / 2, (num_steps * 2))[1:-1]
-                offsets = [0]
-                offsets.extend([-val for val in arr])
+                return [duration / 2 * 0.65, duration / 2 * 0.75]
             else:
                 arr = np.linspace(0, duration, num_steps + 1)[1:]
                 arr[-1] *= overlap
                 offsets = [0]
                 offsets.extend([x for val in arr for x in (val, -val)])
+                offsets = [x / 2 for x in offsets]
             return offsets
         
         screenshots = []
 
+        duration = await video.evaluate('v => v.duration')
+
         for idx, sub in enumerate(subtitles):
+            temp =[]
             # Dynamic offset range  
             offsets = get_offset(sub['duration'], sub['is_lyrics'])
 
-            for offset in offsets:
-                timestamp = (sub['start'] + sub['end']) / 2 + offset
+        for offset in offsets:
+            timestamp = (sub['start'] + sub['end']) / 2 + offset
+            if (timestamp <= 120 or timestamp >= duration - 180) and SKIP_SONGS:
+                continue
                 
-                await video.evaluate(f'v => v.currentTime = {timestamp}')
-                await asyncio.sleep(0.2)
-                
-                screenshot = await video.screenshot()
-                screenshots.append((idx, sub, screenshot))
+            await video.evaluate(f'v => v.currentTime = {timestamp}')
+            await asyncio.sleep(0.2)
             
-            return screenshots 
+            screenshot = await video.screenshot()
+            temp.append((offset, screenshot))
+                
+            screenshots.append((idx, sub, temp))
+            
+        return screenshots 
 
-    async def process_screenshots(self, screenshots: tuple[int, dict, bytes]):
+    async def process_screenshots(
+        self, 
+        screenshots: list[tuple[int, dict, list[tuple[float, bytes]]]]
+    ) -> list[tuple[int, str]]:
         '''
-        Parallel OCR with semaphore to control concurrency
+        Parallel OCR processing. ProcessPoolExecutor handles concurrency limit.
         '''
-        semaphore = asyncio.Semaphore(5)  # 5 concurrent OCR tasks
+        async def ocr_task(idx: int, sub: dict, screenshot_list: list[tuple[float, bytes]]) -> tuple[int, str]:
+            loop = asyncio.get_event_loop()
+            text, conf = await loop.run_in_executor(
+                self.executor,
+                _ocr_subs, 
+                sub, 
+                screenshot_list
+            )
+            return (idx, text, conf)
         
-        async def ocr_task(idx: int, sub, screenshot) -> tuple[int, str]:
-            async with semaphore:
-                # Run blocking OCR in executor
-                loop = asyncio.get_event_loop()
-                text = await loop.run_in_executor(
-                    None, 
-                    self.ocr_subs,
-                    sub, 
-                    screenshot
-                )
-                return (idx, text) 
+        # Filter out None entries but create tasks with original indices
+        tasks = [
+            ocr_task(idx, sub, ss_list) 
+            for item in screenshots 
+            if item is not None
+            for idx, sub, ss_list in [item]
+        ]
         
-        tasks = [ocr_task(idx, sub, ss) for idx, sub, ss in screenshots]  # ← Unpack 3 items
-        results = await asyncio.gather(*tasks)
+        results = []
+        for coro in tqdm.as_completed(tasks, total=len(tasks), desc='OCR Processing', unit='subtitle'):
+            result = await coro
+            results.append(result)
+        
         return results
 
-    def ocr_subs(self, sub: dict, screenshot_bytes: bytes):
-        '''
-        Extract Chinese text from screenshot subtitle region via OCR
-        '''
-        nparr = np.frombuffer(screenshot_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Extract subtitle region
-        y1, y2, x1, x2 = self.subtitle_region
-        subtitle_img = img[y1:y2, x1:x2]
-        
-        # Run OCR on subtitle region
-        result = self.ocr.predict(subtitle_img)
-        
-        if not result or len(result) == 0:
-            return None
-        
-        # Access the OCRResult object
-        ocr_result = result[0]
-        
-        # Get texts and scores
-        texts = ocr_result['rec_texts']
-        scores = ocr_result['rec_scores']
-        
-        if not texts:
-            return None
-        
-        # Filter by confidence > 0.2 and print results
-        filtered_texts = []
-        for text, score in zip(texts, scores):
-            if score > 0.2:
-                filtered_texts.append(text)
-        
-        return ''.join(filtered_texts) if filtered_texts else None
-
-    def process_and_save(self, ocr_results: str, subtitles: dict, output_file='subtitles_cn.json'):
+    def process_and_save(self, ocr_results: tuple[str, float], subtitles: dict, output_file='subtitles_cn.json'):
         '''
         Convert Chinese text to pinyin and save final subtitle file
         '''
         # Create a map: index -> chinese text
-        results_map = {idx: cn_text for idx, cn_text in ocr_results}
+        results_map = {idx: (cn_text, conf) for idx, cn_text, conf in ocr_results}
         
         final_subtitles = []
         
         for i, sub in enumerate(subtitles):
-            cn_text = results_map.get(i)  # Get OCR result if exists
+            result = results_map.get(i)  # Get OCR result if exists
             
-            if cn_text:
+            if result:
+                cn_text, conf = result
                 # Convert to pinyin
                 pinyin_text = ' '.join(lazy_pinyin(cn_text, style=Style.TONE))
                 
@@ -263,7 +366,8 @@ class SubtitleExtractor:
                     'end': sub['end'],
                     'hanzi': cn_text,
                     'pinyin': pinyin_text,
-                    'english': sub['text']
+                    'english': sub['text'],
+                    'confidence': round(conf, 3)
                 })
             else:
                 # OCR failed or no screenshot, still include the entry
@@ -272,7 +376,7 @@ class SubtitleExtractor:
                     'end': sub['end'],
                     'hanzi': '',
                     'pinyin': '',
-                    'english': sub['text']
+                    'english': sub['text']                
                 })
         
         # Save to JSON
@@ -290,65 +394,69 @@ class SubtitleExtractor:
         print(f'📊 OCR success rate: {success_count}/{len(final_subtitles)} ({success_count/len(final_subtitles)*100:.1f}%)')
 
     async def extract(self, output_file='subtitles_cn.json'):
-        async with async_playwright() as p:
-            browser = await p.chromium.launch_persistent_context(
-                user_data_dir='/tmp/playwright-chrome',
-                headless=False,
-                channel='chrome',  # Use real Chrome, not Chromium
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-automation',
-                    '--disable-infobars',
-                ],
-                viewport={'width': 1920, 'height': 1080}
-            )
-            page = browser.pages[0] if browser.pages else await browser.new_page()
-        
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-            """)
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch_persistent_context(
+                    user_data_dir='/tmp/playwright-chrome',
+                    headless=False,
+                    channel='chrome',  # Use real Chrome, not Chromium
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-automation',
+                        '--disable-infobars',
+                    ],
+                    viewport={'width': 1920, 'height': 1080}
+                )
+                page = browser.pages[0] if browser.pages else await browser.new_page()
             
-            print(f'\n📺 Opening: {self.url}')
-            await page.goto(self.url, wait_until='networkidle')
-
-            # Find and click the button to turn off comments
-            button = await page.query_selector(os.getenv('BUTTON_SELECTOR'))
-            if button:
-                await button.click()
-            
-            video = await page.query_selector('#video_player')
-            
-            # Start playback
-            await video.evaluate('v => v.play()')
-            
-            # Wait for playback to start
-            print('⏳ Waiting for playback to start...')
-            await page.wait_for_function(
-                'document.querySelector("#video_player").currentTime > 0',
-                timeout=10000
-            )
-            
-            # Set subtitle region
-            await self.set_dimensions(video)
-            # await self.show_overlay(page, video)
-            
-            # Load subtitles
-            print(f'\n📄 Loading subtitles from {self.subs_path}')
-            subtitles = self.load_subs(self.subs_path, time_offset=AD_OFFSET)
-            
-            # Collect screenshots
-            print(f'\n📸 Collecting screenshots...')
-            screenshots = await self.collect_screenshots(video, subtitles)
-            
-            
-
-            # Save results
-            self.process_and_save(screenshots, subtitles, output_file)
-            
-            await browser.close()          
+                await page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                """)
                 
+                print(f'\n📺 Opening: {self.url}')
+                await page.goto(self.url, wait_until='networkidle')
+
+                # Find and click the button to turn off comments
+                button = await page.query_selector(os.getenv('BUTTON_SELECTOR'))
+                if button:
+                    await button.click()
+                
+                video = await page.query_selector('#video_player')
+                
+                # Start playback
+                await video.evaluate('v => v.play()')
+                
+                # Wait for playback to start
+                print('⏳ Waiting for playback to start...')
+                await page.wait_for_function(
+                    'document.querySelector("#video_player").currentTime > 0',
+                    timeout=10000
+                )
+                
+                # Set subtitle region
+                await self.set_dimensions(video)
+                # await self.show_overlay(page, video)
+                
+                # Load subtitles
+                print(f'\n📄 Loading subtitles from {self.subs_path}')
+                subtitles = self.load_subs(self.subs_path, time_offset=AD_OFFSET)
+                
+                # Collect screenshots
+                print(f'\n📸 Collecting screenshots...')
+                screenshots = await self.collect_screenshots(video, subtitles)
+                await browser.close()    
+                
+                results = await self.process_screenshots(screenshots)
+
+                # Save results
+                self.process_and_save(results, subtitles, output_file)
+        finally:
+            if self.executor:
+                self.executor.shutdown(wait=True)
+                print('🧹 Cleaned up worker processes')
+                                   
 async def main():
     video_url = os.getenv('VIDEO_URL')
     subs_path = os.getenv('SUBS_PATH')
