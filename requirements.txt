@@ -8,3 +8,5 @@ pandas
 numpy
 matplotlib
 tqdm
+sentence-transformers
+scikit-learn
