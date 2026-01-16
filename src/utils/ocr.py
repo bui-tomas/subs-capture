@@ -27,7 +27,7 @@ def init_worker(regions: dict):
     _worker_ocr = PaddleOCR(use_textline_orientation=True, lang='ch')
     _worker_regions = regions
 
-def _ocr_subs(sub: dict, screenshot_list: list[tuple[float, bytes]]) -> tuple[str, dict]:
+def ocr_subs(sub: dict, screenshot_list: list[tuple[float, bytes]]) -> tuple[str, dict]:
     '''
     Worker function that uses global OCR instance
     '''

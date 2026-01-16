@@ -1,27 +1,26 @@
 import json
-import logging
 import os
 import asyncio
 import cv2
 import numpy as np
-from paddleocr import PaddleOCR
 from pypinyin import lazy_pinyin, Style
-from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 from concurrent.futures import ProcessPoolExecutor
+from utils.ocr import calculate_regions, init_worker, ocr_subs
+from utils.browser import run_browser_pipeline, collect_screenshots
 
-load_dotenv()
-
-SUBS_PATH = os.getenv('SUBS_PATH')
-SKIP_SONGS = True
 NUM_WORKERS = 4
-AD_BUFFER = 30
 
 class SubtitleExtractor:
-    def __init__(self, url: str = None, subs_path: str = None):
+    def __init__(self, 
+    url: str = None, 
+    subs_path: str = None,
+    button_selector: str = None,
+    ad_offset: float = 0
+    ):
         self.url = url
-        self.subs_path = SUBS_PATH if SUBS_PATH else subs_path
-        self.screenshot_folder = f'screenshots/{SUBS_PATH.split('/')[-1].split('.')[0]}'
+        self.subs_path = subs_path
+        self.screenshot_folder = f'screenshots/{subs_path.split('/')[-1].split('.')[0]}'
         os.makedirs(self.screenshot_folder, exist_ok=True)
         self.executor = None
 
@@ -32,54 +31,90 @@ class SubtitleExtractor:
         self.right_lyrics_region = None
 
         self.subtitles = []
-        self.ad_offset = 0
+        self.ad_offset = ad_offset
         self.offset_start = None
+        self.button_selector = button_selector
 
-    def extract(self, file_dir: str = None):
+    def capture_screenshots(self):
+        self._load_subs(self.subs_path)
+        self.subtitles = self._process_subs(time_offset=self.ad_offset)
+
+        async def task(page, video):
+            # Set dimensions from first screenshot
+            screenshot = await video.screenshot()
+            img = cv2.imdecode(np.frombuffer(screenshot, np.uint8), cv2.IMREAD_COLOR)
+            self.video_height, self.video_width = img.shape[:2]
+            
+            return await collect_screenshots(
+                video=video,
+                subtitles=self.subtitles,
+                screenshot_folder=self.screenshot_folder
+            )
+        
+        screenshots = asyncio.run(run_browser_pipeline(
+            url=self.url,
+            task=task,
+            button_selector=self.button_selector
+        ))
+        
+        return screenshots
+
+    def extract_hanzi(self, chunk_size: int = 50):
         try:
             self._load_subs(self.subs_path)
-
-            # Load screenshots from disk
-            self._init_workers(file_dir)
-            screenshots = self._load_screenshots_from_disk(file_dir)
-
-            results = asyncio.run(self._process_screenshots(screenshots))
-            self._process_and_save(results, self.subtitles)
+            self._init_workers(self.screenshot_folder)
+            
+            all_results = []
+            screenshot_paths = self._get_screenshot_paths(self.screenshot_folder)
+            
+            # Process in chunks
+            for i in range(0, len(screenshot_paths), chunk_size):
+                chunk_paths = screenshot_paths[i:i + chunk_size]
+                screenshots = self._load_screenshots_chunk(chunk_paths)
+                
+                results = asyncio.run(self._process_screenshots(screenshots))
+                all_results.extend(results)
+                
+                print(f'Processed {min(i + chunk_size, len(screenshot_paths))}/{len(screenshot_paths)}')
+            
+            self._process_and_save(all_results, self.subtitles)
         finally:
             if self.executor:
                 self.executor.shutdown(wait=True)
-                print('Cleaned up worker processes')
 
-    def _load_screenshots_from_disk(self, file_dir: str) -> list[tuple[int, dict, list[tuple[float, bytes]]]]:
-        '''Load pre-captured screenshots from disk'''
+    def _get_screenshot_paths(self, file_dir: str) -> list[tuple[int, str]]:
+        '''Get all screenshot paths with their subtitle index'''
         import glob
         from pathlib import Path
         
-        screenshots_by_idx = {}
         self.subtitles = self._process_subs(time_offset=self.ad_offset)
+        paths_by_idx = {}
         
-        # Pattern: sub_{start}s_offset_{offset}s.png
         for img_path in glob.glob(f'{file_dir}/sub_*.png'):
             filename = Path(img_path).stem
-            # Parse: sub_123.45s_offset_+0.50s
             parts = filename.split('_')
             start_time = float(parts[1].rstrip('s'))
             offset = float(parts[3].rstrip('s'))
             
-            # Find matching subtitle index
             for idx, sub in enumerate(self.subtitles):
-                if abs(sub['start'] - start_time) < 0.01:  # Match within 10ms
-                    if idx not in screenshots_by_idx:
-                        screenshots_by_idx[idx] = []
-                    
-                    with open(img_path, 'rb') as f:
-                        screenshot_bytes = f.read()
-                    screenshots_by_idx[idx].append((offset, screenshot_bytes))
+                if abs(sub['start'] - start_time) < 0.01:
+                    if idx not in paths_by_idx:
+                        paths_by_idx[idx] = []
+                    paths_by_idx[idx].append((offset, img_path))
                     break
         
-        # Convert to expected format
-        return [(idx, self.subtitles[idx], screenshots_by_idx[idx]) 
-                for idx in sorted(screenshots_by_idx.keys())]
+        return [(idx, paths_by_idx[idx]) for idx in sorted(paths_by_idx.keys())]
+
+    def _load_screenshots_chunk(self, chunk: list[tuple[int, list]]) -> list[tuple[int, dict, list[tuple[float, bytes]]]]:
+        '''Load a chunk of screenshots into memory'''
+        result = []
+        for idx, path_list in chunk:
+            screenshots = []
+            for offset, img_path in path_list:
+                with open(img_path, 'rb') as f:
+                    screenshots.append((offset, f.read()))
+            result.append((idx, self.subtitles[idx], screenshots))
+        return result
 
     def _init_workers(self, file_dir: str):
         '''Initialize executor using dimensions from existing screenshots'''
@@ -90,46 +125,22 @@ class SubtitleExtractor:
         img = cv2.imread(first_img)
         self.video_height, self.video_width = img.shape[:2]
         
-        h, w = self.video_height, self.video_width
-        self.subtitle_region = (int(h * 0.76), int(h * 0.89), int(w * 0.27), int(w * 0.73))
-        self.left_lyrics_region = (int(h * 0.2), int(h * 0.65), int(w * 0.05), int(w * 0.085))
-        self.right_lyrics_region = (int(h * 0.2), int(h * 0.65), int(w * 0.88), int(w * 0.93))
-        
+        regions = calculate_regions(self.video_height, self.video_width)
+
         self.executor = ProcessPoolExecutor(
             max_workers=NUM_WORKERS,
-            initializer=_init_worker,
-            initargs=(self.subtitle_region, self.left_lyrics_region, self.right_lyrics_region)
+            initializer=init_worker,
+            initargs=(regions,)
         )
 
     def _load_subs(self, file_path: str):    
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        self.ad_offset = data['ad_offset']
         self.url = data['target_url']
         self.subtitles = data['subtitles']
         self.offset_start = data['offset_start'] if data['offset_start'] != 'None' else None
-
-    async def _set_dimensions(self, video: ElementHandle):
-        screenshot = await video.screenshot()
-
-        if self.video_width is None:
-            nparr = np.frombuffer(screenshot, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            self.video_height, self.video_width = img.shape[:2]
-
-        h, w = self.video_height, self.video_width
-
-        self.subtitle_region = (int(h * 0.76), int(h * 0.89), int(w * 0.27), int(w * 0.73))
-        self.left_lyrics_region = (int(h * 0.2), int(h * 0.65), int(w * 0.05), int(w * 0.085))
-        self.right_lyrics_region = (int(h * 0.2), int(h * 0.65), int(w * 0.88), int(w * 0.93))
-
-        self.executor = ProcessPoolExecutor(
-            max_workers=NUM_WORKERS,
-            initializer=_init_worker,
-            initargs=(self.subtitle_region, self.left_lyrics_region, self.right_lyrics_region)
-        )
-
+    
     def _process_subs(self, time_offset=0):
         '''
         Loads subtitles from JSON file and apply time offset
@@ -186,7 +197,7 @@ class SubtitleExtractor:
             loop = asyncio.get_event_loop()
             text, conf = await loop.run_in_executor(
                 self.executor,
-                _ocr_subs, 
+                ocr_subs, 
                 sub, 
                 screenshot_list
             )
@@ -254,7 +265,7 @@ class SubtitleExtractor:
                     failed_segments.append(sub)
         
         # Base filename from env
-        base_name = os.getenv('SUBS_PATH').split('/')[-1].split('.')[0]
+        base_name = self.subs_path.split('/')[-1].split('.')[0]
         
         # Save to JSON
         output_data = {
@@ -273,7 +284,7 @@ class SubtitleExtractor:
                 for sub in failed_segments:
                     f.write(f'{sub['start']}, {sub['end']}, {sub['text']}\n')
 
-            print(f'⚠️  Saved {len(failed_segments)} failed segments to {base_name}_errors.txt')
+            print(f'Saved {len(failed_segments)} failed segments to {base_name}_errors.txt')
         
         # Calculate success rate (excluding lyrics)
         non_lyrics_subs = [s for s in final_subtitles if '♪' not in s['english']]

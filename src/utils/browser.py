@@ -1,9 +1,33 @@
 from typing import Callable, Awaitable, Any
 from playwright.async_api import async_playwright, Page, ElementHandle
+import asyncio
+import numpy as np
 
-async def _collect_screenshots( 
+def _check_ad_break(timestamp: float, ad_breaks: list[tuple[float, bool]], buffer: float = 30) -> tuple[str, int | None]:
+    '''
+    Check if timestamp hits an ad break.
+    
+    Returns:
+        ('buffer', break_index) - timestamp is in buffer zone before ad
+        ('wait', break_index) - timestamp crossed ad threshold, need to wait
+        ('capture', None) - normal capture, no ad issue
+    '''
+    for i, (ad_time, played) in enumerate(ad_breaks):
+        if played:
+            continue
+        
+        if ad_time - buffer <= timestamp < ad_time:
+            return ('buffer', i)
+        
+        if timestamp >= ad_time:
+            return ('wait', i)
+    
+    return ('capture', None)
+
+async def collect_screenshots( 
     video: ElementHandle, 
     subtitles: list[dict],
+    screenshot_folder: str,
     start_index: int = None
 ) -> list[tuple[int, dict, list[tuple[float, bytes]]]]:
     '''
@@ -59,44 +83,40 @@ async def _collect_screenshots(
         for offset in offsets:
             timestamp = (sub['start'] + sub['end']) / 2 + offset + margin
             
-            if ((timestamp <= 120 or timestamp >= duration - 180) 
-                and SKIP_SONGS and sub['is_lyrics']):
+            if (timestamp <= 120 or timestamp >= duration - 180) and sub['is_lyrics']:
                 continue
-
-            # Check ad breaks
-            for i, (ad_time, played) in enumerate(ad_breaks):
-                if ad_time - AD_BUFFER <= timestamp < ad_time and not played:
-                    ad_buffer.append((idx, offset, timestamp))
-                    break
-                
-                if timestamp >= ad_time and not played:
-                    ad_breaks[i] = (ad_time, True)
-                    await seek_to_timestamp(video, timestamp)
-                    
-                    # Capture buffered screenshots
-                    for buf_idx, buf_offset, buf_ts in ad_buffer:
-                        await seek_to_timestamp(video, buf_ts)
-                        screenshot = await video.screenshot()
-                        with open(f'{self.screenshot_folder}/sub_{sub['start']}s_offset_{offset:+.2f}s.png', 'wb') as f:
-                            f.write(screenshot)
-                        screenshots_by_idx[buf_idx].append((buf_offset, screenshot))
-                    
-                    ad_buffer.clear()
-                    break
-            else:
-                # Only runs if NO break was hit (normal capture)
+            
+            action, break_idx = _check_ad_break(timestamp, ad_breaks)
+            
+            if action == 'buffer':
+                ad_buffer.append((idx, offset, timestamp))
+                continue
+            
+            if action == 'wait':
+                ad_breaks[break_idx] = (ad_breaks[break_idx][0], True)
                 await seek_to_timestamp(video, timestamp)
-                screenshot = await video.screenshot()
-                with open(f'{self.screenshot_folder}/sub_{sub['start']}s_offset_{offset:+.2f}s.png', 'wb') as f:
-                    f.write(screenshot)                    
-                screenshots_by_idx[idx].append((offset, screenshot))
+                
+                # Flush buffer
+                for buf_idx, buf_offset, buf_ts in ad_buffer:
+                    await seek_to_timestamp(video, buf_ts)
+                    screenshot = await video.screenshot()
+                    with open(f'{screenshot_folder}/sub_{sub["start"]}s_offset_{offset:+.2f}s.png', 'wb') as f:
+                        f.write(screenshot)
+                    screenshots_by_idx[buf_idx].append((buf_offset, screenshot))
+                ad_buffer.clear()
+            
+            # Normal capture (both 'wait' after flush and 'capture')
+            await seek_to_timestamp(video, timestamp)
+            screenshot = await video.screenshot()
+            with open(f'{screenshot_folder}/sub_{sub["start"]}s_offset_{offset:+.2f}s.png', 'wb') as f:
+                f.write(screenshot)
+            screenshots_by_idx[idx].append((offset, screenshot))
 
     # Convert dict back to list format
     screenshots = [(idx, subtitles[idx], screenshots_by_idx[idx]) 
                 for idx in sorted(screenshots_by_idx.keys())]
 
     return screenshots
-
 
 async def run_browser_pipeline(
     url: str,
