@@ -18,8 +18,6 @@ class SubtitleCalibrator:
     def __init__(self, subs_path: str = None):
         self.url = None
         self.subs_path = SUBS_PATH if SUBS_PATH else subs_path
-        self.screenshot_folder = f'screenshots/{SUBS_PATH.split('/')[-1].split('.')[0]}'
-        os.makedirs(self.screenshot_folder, exist_ok=True)
         self.ocr = PaddleOCR(
             use_textline_orientation=True,
             lang='ch',
@@ -134,7 +132,6 @@ class SubtitleCalibrator:
             
             # Set subtitle region
             await self._set_dimensions(video)
-            await self._show_overlay(page, video)
 
             subs = self._load_subs(self.subs_path)
             offsets = self._get_offset(self.ad_offset)
@@ -177,7 +174,7 @@ class SubtitleCalibrator:
                     }}
                 }})
             ''')
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
 
         screenshots = []
         self.sample = get_samples(subs)
@@ -190,8 +187,6 @@ class SubtitleCalibrator:
                 timestamp = (sub['start'] + sub['end']) / 2 + offset
                 await seek_to_timestamp(video, timestamp)
                 screenshot = await video.screenshot()
-                with open(f'{self.screenshot_folder}/sub_{sub['start']}s_offset_{offset:+.2f}s.png', 'wb') as f:
-                    f.write(screenshot)
                 screenshots.append((offset, idx, screenshot))
 
         return screenshots
@@ -319,63 +314,3 @@ class SubtitleCalibrator:
 
         self.ad_offset = data['ad_offset']
         self.url = data['target_url']
-
-    async def _show_overlay(self, page: Page, video: ElementHandle):
-        '''
-        Draws a yellow border around detected subtitle region
-        '''
-
-        # Get video position on page
-        box = await video.bounding_box()
-
-        y1, y2, x1, x2 = self.subtitle_region
-        ly1, ly2, lx1, lx2 = self.left_lyrics_region
-        ry1, ry2, rx1, rx2 = self.right_lyrics_region
-        
-        # Inject overlay div
-        await page.evaluate(f'''
-                // Subtitle overlay (yellow)
-                const overlay = document.createElement('div');
-                overlay.id = 'subtitle-debug-overlay';
-                overlay.style.cssText = `
-                    position: fixed;
-                    left: {box['x'] + x1}px;
-                    top: {box['y'] + y1}px;
-                    width: {x2 - x1}px;
-                    height: {y2 - y1}px;
-                    border: 3px solid yellow;
-                    pointer-events: none;
-                    z-index: 99999;
-                `;
-                document.body.appendChild(overlay);
-                
-                // Left lyrics overlay (blue)
-                const leftLyrics = document.createElement('div');
-                leftLyrics.id = 'left-lyrics-overlay';
-                leftLyrics.style.cssText = `
-                    position: fixed;
-                    left: {box['x'] + lx1}px;
-                    top: {box['y'] + ly1}px;
-                    width: {lx2 - lx1}px;
-                    height: {ly2 - ly1}px;
-                    border: 3px solid blue;
-                    pointer-events: none;
-                    z-index: 99999;
-                `;
-                document.body.appendChild(leftLyrics);
-                
-                // Right lyrics overlay (green)
-                const rightLyrics = document.createElement('div');
-                rightLyrics.id = 'right-lyrics-overlay';
-                rightLyrics.style.cssText = `
-                    position: fixed;
-                    left: {box['x'] + rx1}px;
-                    top: {box['y'] + ry1}px;
-                    width: {rx2 - rx1}px;
-                    height: {ry2 - ry1}px;
-                    border: 3px solid green;
-                    pointer-events: none;
-                    z-index: 99999;
-                `;
-                document.body.appendChild(rightLyrics);
-            ''')

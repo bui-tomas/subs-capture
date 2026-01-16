@@ -553,6 +553,7 @@ class SubtitleExtractor:
                 headless=False,
                 channel='chrome',
                 args=[
+                    '--mute-audio',
                     '--disable-blink-features=AutomationControlled',
                     '--disable-automation',
                     '--disable-infobars',

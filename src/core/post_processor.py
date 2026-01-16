@@ -221,4 +221,4 @@ def post_process_subtitles(input_file: str, output_file: str):
     print(f'✅ Processed {len(processed)} subtitles → {output_file}')
 
 if __name__ == '__main__':
-    post_process_subtitles('subs/loves_ambition/loves_ambition_ep_7_subs_raw.json', 'subs/loves_ambition/loves_ambition_ep_7_subs_cleaned.json')
+    post_process_subtitles('subs/loves_ambition/loves_ambition_ep_8_subs_raw.json', 'subs/loves_ambition/loves_ambition_ep_8_subs_cleaned.json')

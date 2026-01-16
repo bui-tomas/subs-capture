@@ -438,11 +438,11 @@ class ScreenshotSampler:
         return ocr_results
 
 if __name__ == '__main__':
-    video_url = 'https://www.iyf.tv/play/MBxLp76dbY1?id=pSPhZ74Jks6'
+    video_url = 'https://www.iyf.tv/play/MBxLp76dbY1?id=nuY8fDGyIt3'
     
     # Define segments to sample
     # segments = load_failed_segments('loves_ambition_ep_2_en_subs.json_errors.txt')
-    segments = get_segments_with_timing('subs/loves_ambition/loves_ambition_ep_8_subs.json', 1105, 1120)
+    segments = get_segments_with_timing('subs/loves_ambition/loves_ambition_ep_9_subs.json', 1440, 1460)
 
     temp = []
     offset = 0 + 10.5

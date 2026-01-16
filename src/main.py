@@ -1,7 +1,9 @@
-from utils.extractor import SubtitleExtractor
-from utils.calibrator import SubtitleCalibrator
+from core.extractor import SubtitleExtractor
+from core.calibrator import SubtitleCalibrator
 
 def pipeline():
+    calibrator = SubtitleCalibrator()
+    offset = calibrator.calibrate()
     pass
 
 def main():
