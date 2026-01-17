@@ -3,6 +3,7 @@ import warnings
 import cv2
 import numpy as np
 from paddleocr import PaddleOCR
+from concurrent.futures import ProcessPoolExecutor
 
 # Annoying warning
 logging.getLogger('ppocr').setLevel(logging.ERROR)
@@ -26,6 +27,28 @@ def init_worker(regions: dict):
     global _worker_ocr, _worker_regions
     _worker_ocr = PaddleOCR(use_textline_orientation=True, lang='ch')
     _worker_regions = regions
+
+def init_workers(
+    file_dir: str,
+    num_workers = 4
+):
+    '''Initialize executor using dimensions from existing screenshots'''
+    import glob
+    
+    # Load first screenshot to get dimensions
+    first_img = glob.glob(f'{file_dir}/sub_*.png')[0]
+    img = cv2.imread(first_img)
+    video_height, video_width = img.shape[:2]
+    
+    regions = calculate_regions(video_height, video_width)
+
+    executor = ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=init_worker,
+        initargs=(regions,)
+    )
+
+    return executor
 
 def ocr_subs(sub: dict, screenshot_list: list[tuple[float, bytes]]) -> tuple[str, dict]:
     '''

@@ -64,7 +64,7 @@ async def collect_screenshots(
     # Track screenshots by index
     screenshots_by_idx = {}
     duration = await video.evaluate('v => v.duration')
-    ad_breaks = [(duration * 0.5, False), (duration * 0.75, False)]  # (timestamp, played)
+    ad_breaks = [(duration * 0.5, False)]  # (timestamp, played)
     margin = 0
 
     for idx, sub in enumerate(subtitles):

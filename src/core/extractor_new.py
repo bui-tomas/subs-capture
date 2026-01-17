@@ -6,10 +6,8 @@ import numpy as np
 from pypinyin import lazy_pinyin, Style
 from tqdm.asyncio import tqdm
 from concurrent.futures import ProcessPoolExecutor
-from utils.ocr import calculate_regions, init_worker, ocr_subs
+from utils.ocr import init_workers, ocr_subs
 from utils.browser import run_browser_pipeline, collect_screenshots
-
-NUM_WORKERS = 4
 
 class SubtitleExtractor:
     def __init__(self, 
@@ -62,7 +60,7 @@ class SubtitleExtractor:
     def extract_hanzi(self, chunk_size: int = 50):
         try:
             self._load_subs(self.subs_path)
-            self._init_workers(self.screenshot_folder)
+            self.executor = init_workers(self.screenshot_folder)
             
             all_results = []
             screenshot_paths = self._get_screenshot_paths(self.screenshot_folder)
@@ -115,23 +113,6 @@ class SubtitleExtractor:
                     screenshots.append((offset, f.read()))
             result.append((idx, self.subtitles[idx], screenshots))
         return result
-
-    def _init_workers(self, file_dir: str):
-        '''Initialize executor using dimensions from existing screenshots'''
-        import glob
-        
-        # Load first screenshot to get dimensions
-        first_img = glob.glob(f'{file_dir}/sub_*.png')[0]
-        img = cv2.imread(first_img)
-        self.video_height, self.video_width = img.shape[:2]
-        
-        regions = calculate_regions(self.video_height, self.video_width)
-
-        self.executor = ProcessPoolExecutor(
-            max_workers=NUM_WORKERS,
-            initializer=init_worker,
-            initargs=(regions,)
-        )
 
     def _load_subs(self, file_path: str):    
         with open(file_path, 'r', encoding='utf-8') as f:
