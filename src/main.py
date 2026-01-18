@@ -1,4 +1,4 @@
-from core.extractor import SubtitleExtractor
+from core.extractor_new import SubtitleExtractor
 from core.calibrator import SubtitleCalibrator
 
 import os
@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SUBS_PATH = os.getenv('SUBS_PATH')
+BUTTON_SELECTOR = os.getenv('BUTTON_SELECTOR')
 
 def pipeline():
     calibrator = SubtitleCalibrator()
@@ -22,9 +23,11 @@ def main():
 
 def test():
     calibrator = SubtitleCalibrator(subs_path=SUBS_PATH)
-    calibrator.calibrate()
+    margins = calibrator.calibrate()
 
-    # extractor = SubtitleExtractor()
+    extractor = SubtitleExtractor(subs_path=SUBS_PATH, button_selector=BUTTON_SELECTOR, margins=margins)
+    extractor.capture_screenshots()
+    extractor.extract_hanzi()
 
     # extractor.extract()
 

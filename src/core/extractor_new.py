@@ -5,16 +5,15 @@ import cv2
 import numpy as np
 from pypinyin import lazy_pinyin, Style
 from tqdm.asyncio import tqdm
-from concurrent.futures import ProcessPoolExecutor
 from utils.ocr import init_workers, ocr_subs
 from utils.browser import run_browser_pipeline, collect_screenshots
 
 class SubtitleExtractor:
     def __init__(self, 
-    url: str = None, 
-    subs_path: str = None,
+    url: str, 
+    subs_path: str,
+    margins: list[tuple[int, float]],
     button_selector: str = None,
-    ad_offset: float = 0
     ):
         self.url = url
         self.subs_path = subs_path
@@ -29,13 +28,11 @@ class SubtitleExtractor:
         self.right_lyrics_region = None
 
         self.subtitles = []
-        self.ad_offset = ad_offset
-        self.offset_start = None
+        self.margins = margins
         self.button_selector = button_selector
 
     def capture_screenshots(self):
         self._load_subs(self.subs_path)
-        self.subtitles = self._process_subs(time_offset=self.ad_offset)
 
         async def task(page, video):
             # Set dimensions from first screenshot
@@ -115,14 +112,6 @@ class SubtitleExtractor:
         return result
 
     def _load_subs(self, file_path: str):    
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        self.url = data['target_url']
-        self.subtitles = data['subtitles']
-        self.offset_start = data['offset_start'] if data['offset_start'] != 'None' else None
-    
-    def _process_subs(self, time_offset=0):
         '''
         Loads subtitles from JSON file and apply time offset
         Args:
@@ -133,39 +122,31 @@ class SubtitleExtractor:
         '''
         def is_lyrics(text: str) -> bool:
             return '♪' in text
-
-        apply_offset = self.offset_start is None or self.offset_start.lower() == "none"
         
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        self.url = data['target_url']
+
+        margin_map = {idx: margin for idx, margin in self.margins}
+        margin = 0
+
         subtitles = []
-        for sub in self.subtitles:
-            if apply_offset:
-                subtitles.append({
-                    'start': sub['start'] + time_offset,
-                    'end': sub['end'] + time_offset,
-                    'offset_add': sub.get('offset_add', 0),
-                    'duration': sub['end'] - sub['start'],
-                    'is_lyrics': is_lyrics(sub['text']),
-                    'text': sub['text']
-                })
-            else:
-                subtitles.append({
-                    'start': sub['start'],
-                    'end': sub['end'],
-                    'offset_add': sub.get('offset_add', 0),
-                    'duration': sub['end'] - sub['start'],
-                    'is_lyrics': is_lyrics(sub['text']),
-                    'text': sub['text']
-                })
+        for idx, sub in enumerate(data['subtitles']):
+            if idx in margin_map:
+                margin = margin_map[idx]
 
-            if sub['text'] == self.offset_start:
-                apply_offset = True
-        
-        for sub in subtitles:
-            offset_add = sub.get('offset_add')
-            if offset_add != 0:
-                print('Margin: ', float(offset_add), sub['start'])
+            subtitles.append({
+                'idx': idx,
+                'start': sub['start'],
+                'end': sub['end'],
+                'duration': sub['end'] - sub['start'],
+                'margin': margin,
+                'is_lyrics': is_lyrics(sub['text']),
+                'text': sub['text']
+            })
 
-        return subtitles
+        self.subtitles = subtitles
 
     async def _process_screenshots(
         self, 

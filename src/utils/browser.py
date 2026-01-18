@@ -33,7 +33,7 @@ async def collect_screenshots(
     '''
     Single-pass screenshot collection with 6 samples per subtitle window
     '''
-    def get_offset(duration: float, is_lyrics=False, num_steps=2, overlap=0.9) -> list[float]:
+    def get_offset(duration: float, is_lyrics=False, num_steps=2, overlap=0.7) -> list[float]:
         if is_lyrics:
             return [duration / 2 * 0.65, duration / 2 * 0.75]
         else:
@@ -65,7 +65,6 @@ async def collect_screenshots(
     screenshots_by_idx = {}
     duration = await video.evaluate('v => v.duration')
     ad_breaks = [(duration * 0.5, False)]  # (timestamp, played)
-    margin = 0
 
     for idx, sub in enumerate(subtitles):
         if idx != start_index and start_index is not None:
@@ -73,37 +72,37 @@ async def collect_screenshots(
 
         screenshots_by_idx[idx] = []  # Initialize
         offsets = get_offset(sub['duration'], sub['is_lyrics'])
-        print(f'Timestamp: {sub['start']}')
 
-        offset_add = sub.get('offset_add')
-        if offset_add != 0:
-            print('Margin: ', float(offset_add), sub['start'])
-            margin = offset_add
+        print(f'Start: {sub['start']}, Modified: {sub['start'] + sub['margin']}')
 
         for offset in offsets:
-            timestamp = (sub['start'] + sub['end']) / 2 + offset + margin
+            timestamp = (sub['start'] + sub['end']) / 2 + offset + sub['margin']
             
             if (timestamp <= 120 or timestamp >= duration - 180) and sub['is_lyrics']:
                 continue
             
-            action, break_idx = _check_ad_break(timestamp, ad_breaks)
+            # action, break_idx = _check_ad_break(timestamp, ad_breaks)
             
-            if action == 'buffer':
-                ad_buffer.append((idx, offset, timestamp))
-                continue
+            # if action == 'buffer':
+            #     ad_buffer.append((idx, offset, timestamp))
+            #     continue
             
-            if action == 'wait':
-                ad_breaks[break_idx] = (ad_breaks[break_idx][0], True)
-                await seek_to_timestamp(video, timestamp)
+            # if action == 'wait':
+            #     ad_breaks[break_idx] = (ad_breaks[break_idx][0], True)
+            #     await seek_to_timestamp(video, timestamp)
+
+            #     print(f'\n⏸️  Ad detected at {timestamp:.1f}s - sleeping 30s...')
+            #     await asyncio.sleep(60)
                 
-                # Flush buffer
-                for buf_idx, buf_offset, buf_ts in ad_buffer:
-                    await seek_to_timestamp(video, buf_ts)
-                    screenshot = await video.screenshot()
-                    with open(f'{screenshot_folder}/sub_{sub["start"]}s_offset_{offset:+.2f}s.png', 'wb') as f:
-                        f.write(screenshot)
-                    screenshots_by_idx[buf_idx].append((buf_offset, screenshot))
-                ad_buffer.clear()
+            #     # Flush buffer
+            #     for buf_idx, buf_offset, buf_ts in ad_buffer:
+            #         buf_sub = subtitles[buf_idx]
+            #         await seek_to_timestamp(video, buf_ts)
+            #         screenshot = await video.screenshot()
+            #         with open(f'{screenshot_folder}/sub_{buf_sub["start"]}s_offset_{buf_offset:+.2f}s.png', 'wb') as f:
+            #             f.write(screenshot)
+            #         screenshots_by_idx[buf_idx].append((buf_offset, screenshot))
+            #     ad_buffer.clear()
             
             # Normal capture (both 'wait' after flush and 'capture')
             await seek_to_timestamp(video, timestamp)
@@ -178,6 +177,13 @@ async def run_browser_pipeline(
                 }
             }
         ''')
+
+        duration = await video.evaluate('v => v.duration')
+
+        print(f'Seeking to {duration / 2:.1f}s to trigger ad...')
+        await video.evaluate(f'v => v.currentTime = {duration / 2}')
+        await asyncio.sleep(30)  # Wait for ad to finish
+        print('Starting capture...')
         
         # video = await page.wait_for_selector('mat-video video.video', timeout=10000)
 

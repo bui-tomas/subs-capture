@@ -15,46 +15,46 @@ class SubtitleCalibrator:
     def __init__(self, subs_path: str = None):
         self.url = None
         self.subs_path = subs_path
-        self.ocr = PaddleOCR(
-            use_textline_orientation=True,
-            lang='ch',
-        )
+        self.model = None
 
         self.video_width = None
         self.video_height = None
         self.subtitle_region = None
 
-        self.sample = None
-        self.ad_trigger = -1
-        self.ad_offset = 0
+        self.subtitles = []
+        self.flags = []
+        self.sample = []
 
     def calibrate(self):
-        self._load_metadata(self.subs_path)
+        self._load_subs(self.subs_path)
+        self.model = SentenceTransformer('sentence-transformers/LaBSE')
+
+        def make_task(sample=None, margin=0):
+            async def task(page, video):
+                # Set dimensions
+                screenshot = await video.screenshot()
+                img = cv2.imdecode(np.frombuffer(screenshot, np.uint8), cv2.IMREAD_COLOR)
+                self.video_height, self.video_width = img.shape[:2]
+                self.subtitle_region = calculate_regions(self.video_height, self.video_width)['subtitle']
+                
+                offsets = self._get_offset(margin)
+                return await self._collect_screenshots(video=video, offsets=offsets, sample=sample)
+            return task
         
-        async def task(page, video):
-            # Set dimensions
-            screenshot = await video.screenshot()
-            img = cv2.imdecode(np.frombuffer(screenshot, np.uint8), cv2.IMREAD_COLOR)
-            self.video_height, self.video_width = img.shape[:2]
-            self.subtitle_region = calculate_regions(self.video_height, self.video_width)['subtitle']
-            
-            duration = await video.evaluate('v => v.duration')
-            self.ad_trigger = (duration / 2) - 30
-            
-            subs = self._load_subs(self.subs_path)
-            offsets = self._get_offset(self.ad_offset)
-            
-            return await self._collect_screenshots(video, subs, offsets)
-        
-        screenshots = asyncio.run(run_browser_pipeline(
-            url=self.url,
-            task=task
-        ))
-        
-        return self._score_offsets(screenshots)
+        margins = []
+        for idx, margin in self.flags:
+            self.sample = self._get_sample(idx)
+            screenshots = asyncio.run(run_browser_pipeline(
+                url=self.url,
+                task=make_task(sample=self.sample, margin=margin)
+            ))
+            winner = self._score_offsets(screenshots)
+            margins.append((idx, winner))
+            print(f'Margin at idx {idx}: {winner:+.2f}s')
+
+        return margins
     
     def _score_offsets(self, screenshots):
-        model = SentenceTransformer('sentence-transformers/LaBSE')
         regions = calculate_regions(self.video_height, self.video_width)
         init_worker(regions)  # Sets globals in this process
         
@@ -79,8 +79,8 @@ class SubtitleCalibrator:
                     successful_ocrs += 1
                     
                     if sub.get('text'):
-                        cn_embedding = model.encode([cn_text])
-                        en_embedding = model.encode([sub['text']])
+                        cn_embedding = self.model.encode([cn_text])
+                        en_embedding = self.model.encode([sub['text']])
                         similarity = cosine_similarity(cn_embedding, en_embedding).flatten()[0]
                         semantic_scores.append(similarity)
             
@@ -114,19 +114,21 @@ class SubtitleCalibrator:
         offsets.extend(arr1)
         offsets.extend(arr2)
         return sorted(set(offsets))
+    
+    def _get_sample(self, idx):
+        for i, sub in enumerate(self.subtitles):
+            if sub['idx'] == idx:
+                return self.subtitles[i:i + 8]
+        return []
 
     async def _collect_screenshots(self, 
         video: ElementHandle, 
-        subs: list[dict],
-        offsets: list
+        offsets: list,
+        sample: list[dict] = None
     ) -> list[tuple[int, dict, list[tuple[float, bytes]]]]:
         '''
         Single-pass screenshot collection with 6 samples per subtitle window
         '''
-        
-        def get_samples(subs):
-            random.seed(42)
-            return random.sample(subs, 20)
 
         async def seek_to_timestamp(video, target_time):
             '''Seek to timestamp and wait for seek to complete'''
@@ -143,10 +145,15 @@ class SubtitleCalibrator:
             await asyncio.sleep(0.1)
 
         screenshots = []
-        self.sample = get_samples(subs)
+        duration = await video.evaluate('v => v.duration')
+
+        print(f'Seeking to {duration / 2:.1f}s to trigger ad...')
+        await video.evaluate(f'v => v.currentTime = {duration / 2}')
+        await asyncio.sleep(30)  # Wait for ad to finish
+        print('Starting capture...')
 
         for offset in offsets:
-            for idx, sub in enumerate(self.sample):
+            for idx, sub in enumerate(sample):
                 timestamp = (sub['start'] + sub['end']) / 2 + offset
                 await seek_to_timestamp(video, timestamp)
                 screenshot = await video.screenshot()
@@ -169,25 +176,26 @@ class SubtitleCalibrator:
 
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
+
+        self.url = data['target_url']
         
         subtitles = []
-        for sub in data['subtitles']:
+        for idx, sub in enumerate(data['subtitles']):
             if is_lyrics(sub['text']):
                 continue
-            if sub['start'] < (self.ad_trigger - 30):      
+            else:     
+                margin = sub.get('margin', None)
+                if margin is not None:
+                    self.flags.append((idx, margin))
+                
                 subtitles.append({
+                    'idx': idx,
                     'start': sub['start'],
                     'end': sub['end'],
                     'duration': sub['end'] - sub['start'],
+                    'margin': margin,
                     'text': sub['text'],
                     'is_lyrics': False
                 })
-        
-        return subtitles
 
-    def _load_metadata(self, file_path: str):    
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        self.ad_offset = data['ad_offset']
-        self.url = data['target_url']
+        self.subtitles = subtitles
