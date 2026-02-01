@@ -1,201 +1,186 @@
-import json
-import os
-import asyncio
-import random
 import cv2
 import numpy as np
+import asyncio
 from playwright.async_api import ElementHandle
-from paddleocr import PaddleOCR
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from utils.browser import run_browser_pipeline
-from utils.ocr import init_worker, ocr_subs, calculate_regions
+
 
 class SubtitleCalibrator:
-    def __init__(self, subs_path: str = None):
-        self.url = None
-        self.subs_path = subs_path
-        self.model = None
+    def __init__(self, ad_template_path: str, ad_region: tuple = (0.81, 0.86, 0.955, 0.995)):
+        self.ad_template = cv2.imread(ad_template_path, cv2.IMREAD_GRAYSCALE)
+        self.ad_region = ad_region
 
-        self.video_width = None
-        self.video_height = None
-        self.subtitle_region = None
-
-        self.subtitles = []
-        self.flags = []
-        self.sample = []
-
-    def calibrate(self):
-        self._load_subs(self.subs_path)
-        self.model = SentenceTransformer('sentence-transformers/LaBSE')
-
-        def make_task(sample=None, margin=0):
-            async def task(page, video):
-                # Set dimensions
-                screenshot = await video.screenshot()
-                img = cv2.imdecode(np.frombuffer(screenshot, np.uint8), cv2.IMREAD_COLOR)
-                self.video_height, self.video_width = img.shape[:2]
-                self.subtitle_region = calculate_regions(self.video_height, self.video_width)['subtitle']
-                
-                offsets = self._get_offset(margin)
-                return await self._collect_screenshots(video=video, offsets=offsets, sample=sample)
-            return task
-        
-        margins = []
-        for idx, margin in self.flags:
-            self.sample = self._get_sample(idx)
-            screenshots = asyncio.run(run_browser_pipeline(
-                url=self.url,
-                task=make_task(sample=self.sample, margin=margin)
-            ))
-            winner = self._score_offsets(screenshots)
-            margins.append((idx, winner))
-            print(f'Margin at idx {idx}: {winner:+.2f}s')
-
-        return margins
-    
-    def _score_offsets(self, screenshots):
-        regions = calculate_regions(self.video_height, self.video_width)
-        init_worker(regions)  # Sets globals in this process
-        
-        # Group screenshots by offset
-        offset_groups = {}
-        for (offset, idx, screenshot) in screenshots:
-            if offset not in offset_groups:
-                offset_groups[offset] = []
-            offset_groups[offset].append((idx, screenshot))
-        
-        # Score each offset
-        offset_scores = {}
-        for offset, screenshot_list in offset_groups.items():
-            successful_ocrs = 0
-            semantic_scores = []
-            
-            for idx, screenshot in screenshot_list:
-                sub = self.sample[idx]
-                cn_text, _ = ocr_subs(sub, [(offset, screenshot)])
-                
-                if cn_text:
-                    successful_ocrs += 1
-                    
-                    if sub.get('text'):
-                        cn_embedding = self.model.encode([cn_text])
-                        en_embedding = self.model.encode([sub['text']])
-                        similarity = cosine_similarity(cn_embedding, en_embedding).flatten()[0]
-                        semantic_scores.append(similarity)
-            
-            avg_semantic = np.mean(semantic_scores) if semantic_scores else 0.0
-            offset_scores[offset] = {
-                'count': successful_ocrs,
-                'semantic_avg': avg_semantic
-            }
-        
-        # Find winner
-        max_count = max(s['count'] for s in offset_scores.values())
-        
-        candidates = [
-            (offset, scores) 
-            for offset, scores in offset_scores.items()
-            if scores['count'] >= max_count - 1
-        ]
-        
-        winner = max(candidates, key=lambda x: x[1]['semantic_avg'])[0]
-        
-        # Print results
-        for offset, scores in sorted(offset_scores.items()):
-            print(f'Offset {offset:+.2f}s: {scores["count"]}/{len(self.sample)} OCRs, avg semantic: {scores["semantic_avg"]:.3f}')
-        
-        return winner
-
-    def _get_offset(self, initial: float, num_steps=5) -> list[float]:
-        offsets = [initial]
-        arr1 = np.linspace(initial, initial + 1, num_steps)
-        arr2 = np.linspace(initial - 1, initial, num_steps)
-        offsets.extend(arr1)
-        offsets.extend(arr2)
-        return sorted(set(offsets))
-    
-    def _get_sample(self, idx):
-        for i, sub in enumerate(self.subtitles):
-            if sub['idx'] == idx:
-                return self.subtitles[i:i + 8]
-        return []
-
-    async def _collect_screenshots(self, 
-        video: ElementHandle, 
-        offsets: list,
-        sample: list[dict] = None
-    ) -> list[tuple[int, dict, list[tuple[float, bytes]]]]:
+    async def calibrate(
+        self,
+        video: ElementHandle,
+        intro_reference: float = 104.25,
+        sweep_range: tuple = (900, 1500),
+        sweep_step: float = 3.0
+    ) -> list[tuple[float, float]]:
         '''
-        Single-pass screenshot collection with 6 samples per subtitle window
-        '''
+        Find all ads and return offset boundaries in subtitle time.
 
-        async def seek_to_timestamp(video, target_time):
-            '''Seek to timestamp and wait for seek to complete'''
-            await video.evaluate(f'''
-                v => new Promise(resolve => {{
-                    if (Math.abs(v.currentTime - {target_time}) < 0.1) {{
-                        resolve();
-                    }} else {{
-                        v.currentTime = {target_time};
-                        v.addEventListener('seeked', () => resolve(), {{ once: true }});
-                    }}
-                }})
-            ''')
-            await asyncio.sleep(0.1)
-
-        screenshots = []
-        duration = await video.evaluate('v => v.duration')
-
-        print(f'Seeking to {duration / 2:.1f}s to trigger ad...')
-        await video.evaluate(f'v => v.currentTime = {duration / 2}')
-        await asyncio.sleep(30)  # Wait for ad to finish
-        print('Starting capture...')
-
-        for offset in offsets:
-            for idx, sub in enumerate(sample):
-                timestamp = (sub['start'] + sub['end']) / 2 + offset
-                await seek_to_timestamp(video, timestamp)
-                screenshot = await video.screenshot()
-                screenshots.append((offset, idx, screenshot))
-
-        return screenshots
-
-    def _load_subs(self, file_path: str):
-        '''
-        Loads subtitles from JSON file and apply time offset
-        Args:
-            file_path: path to JSON file with subtitles
-            time_offset: seconds to subtract from all timestamps
         Returns:
-            List of subtitle dicts with adjusted timestamps
+            [(sub_time_boundary, cumulative_offset), ...]
+            Apply: for each sub, use highest boundary it exceeds.
         '''
+        boundaries = []
+        cumulative = 0.0
 
-        def is_lyrics(text: str) -> bool:
-            return '♪' in text
+        # First ad near intro
+        hit = await self._sweep_for_ad(video, 80, 130, step=3.0)
+        if hit is not None:
+            ad_start, ad_end = await self._find_ad_boundaries(video, hit)
+            ad_duration = ad_end - ad_start
+            trim = intro_reference - ad_start
+            cumulative = ad_duration - trim
 
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            # boundary in subtitle time = ad_start (offset was 0 before this)
+            boundaries.append((ad_start, cumulative))
+            print(f'Ad 1: {ad_start:.2f}s -> {ad_end:.2f}s | trim: {trim:.2f}s | offset: {cumulative:.2f}s')
 
-        self.url = data['target_url']
-        
-        subtitles = []
-        for idx, sub in enumerate(data['subtitles']):
-            if is_lyrics(sub['text']):
-                continue
-            else:     
-                margin = sub.get('margin', None)
-                if margin is not None:
-                    self.flags.append((idx, margin))
-                
-                subtitles.append({
-                    'idx': idx,
-                    'start': sub['start'],
-                    'end': sub['end'],
-                    'duration': sub['end'] - sub['start'],
-                    'margin': margin,
-                    'text': sub['text'],
-                    'is_lyrics': False
-                })
+        # Second ad in middle
+        sweep_start = sweep_range[0] + cumulative
+        sweep_end = sweep_range[1] + cumulative
+        hit = await self._sweep_for_ad(video, sweep_start, sweep_end, step=sweep_step)
+        if hit is not None:
+            ad_start, ad_end = await self._find_ad_boundaries(video, hit)
+            ad_duration = ad_end - ad_start
 
-        self.subtitles = subtitles
+            # boundary in subtitle time = ad_start - cumulative (undo previous offset)
+            boundary_sub_time = ad_start - cumulative
+            cumulative += ad_duration
+
+            boundaries.append((boundary_sub_time, cumulative))
+            print(f'Ad 2: {ad_start:.2f}s -> {ad_end:.2f}s | offset: {cumulative:.2f}s')
+
+        return boundaries
+
+    async def _sweep_for_ad(self, video, start: float, end: float, step: float = 3.0) -> float | None:
+        '''Probe at intervals, return first hit or None'''
+        t = start
+        while t <= end:
+            if await self._has_ad(video, t):
+                print(f'Ad badge found at {t:.2f}s')
+                return t
+            t += step
+        return None
+
+    async def _seek(self, video, timestamp):
+        await video.evaluate(f'''
+            v => new Promise(resolve => {{
+                if (Math.abs(v.currentTime - {timestamp}) < 0.1) {{
+                    resolve();
+                }} else {{
+                    v.currentTime = {timestamp};
+                    v.addEventListener('seeked', () => resolve(), {{ once: true }});
+                }}
+            }})
+        ''')
+        await asyncio.sleep(0.1)
+
+    async def _has_ad(self, video, timestamp) -> bool:
+        '''Check if ad badge is visible at given video timestamp'''
+        await self._seek(video, timestamp)
+        screenshot = await video.screenshot()
+
+        img = cv2.imdecode(np.frombuffer(screenshot, np.uint8), cv2.IMREAD_COLOR)
+        h, w = img.shape[:2]
+        y1, y2 = int(h * self.ad_region[0]), int(h * self.ad_region[1])
+        x1, x2 = int(w * self.ad_region[2]), int(w * self.ad_region[3])
+        crop = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+
+        tmpl = self.ad_template
+        if tmpl.shape[0] > crop.shape[0] or tmpl.shape[1] > crop.shape[1]:
+            scale = min(crop.shape[0] / tmpl.shape[0], crop.shape[1] / tmpl.shape[1]) * 0.9
+            tmpl = cv2.resize(tmpl, None, fx=scale, fy=scale)
+
+        result = cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED)
+        return result.max() > 0.7
+
+    async def _linear_scan(self, video, start, end, step, subtitle_region, match_fn, greyscale=False):
+        direction = 1 if end > start else -1
+        t = start
+
+        while (direction == 1 and t <= end) or (direction == -1 and t >= end):
+            await self._seek(video, t)
+            screenshot = await video.screenshot()
+
+            img = cv2.imdecode(np.frombuffer(screenshot, np.uint8), cv2.IMREAD_COLOR)
+            y1, y2, x1, x2 = subtitle_region
+            crop = img[y1:y2, x1:x2]
+
+            if greyscale:
+                crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+            if match_fn(crop):
+                return t, crop
+
+            t += direction * step
+
+        return None, None
+
+    async def _binary_scan(self, lo, hi, match_fn, search_for_start=True, precision=0.25):
+        while hi - lo > precision:
+            mid = (lo + hi) / 2
+            if await match_fn(mid):
+                if search_for_start:
+                    hi = mid
+                else:
+                    lo = mid
+            else:
+                if search_for_start:
+                    lo = mid
+                else:
+                    hi = mid
+        return hi if search_for_start else lo
+
+    async def _find_ad_boundaries(self, video, hit_time):
+        '''Find ad start and end using binary search + linear scan'''
+
+        async def ad_match(timestamp):
+            return await self._has_ad(video, timestamp)
+
+        screenshot = await video.screenshot()
+        img = cv2.imdecode(np.frombuffer(screenshot, np.uint8), cv2.IMREAD_COLOR)
+        h, w = img.shape[:2]
+        ad_pixel_region = (
+            int(h * self.ad_region[0]), int(h * self.ad_region[1]),
+            int(w * self.ad_region[2]), int(w * self.ad_region[3])
+        )
+
+        tmpl = self.ad_template
+        def ad_template_match(crop):
+            t = tmpl
+            if t.shape[0] > crop.shape[0] or t.shape[1] > crop.shape[1]:
+                scale = min(crop.shape[0] / t.shape[0], crop.shape[1] / t.shape[1]) * 0.9
+                t = cv2.resize(t, None, fx=scale, fy=scale)
+            result = cv2.matchTemplate(crop, t, cv2.TM_CCOEFF_NORMED)
+            return result.max() > 0.7
+
+        start_boundary = await self._binary_scan(
+            max(0, hit_time - 60), hit_time, ad_match, search_for_start=True
+        )
+        ad_start, _ = await self._linear_scan(
+            video, start_boundary - 0.3, start_boundary + 0.3, 0.1, ad_pixel_region, ad_template_match, greyscale=True
+        )
+        if ad_start is None:
+            ad_start = start_boundary
+
+        duration = await video.evaluate('v => v.duration')
+        right_bound = hit_time
+        while await ad_match(right_bound):
+            right_bound = min(right_bound + 30, duration)
+            if right_bound >= duration:
+                break
+
+        end_boundary = await self._binary_scan(
+            hit_time, right_bound, ad_match, search_for_start=False
+        )
+        ad_end, _ = await self._linear_scan(
+            video, end_boundary + 0.3, end_boundary - 0.3, 0.1, ad_pixel_region, ad_template_match, greyscale=True
+        )
+        if ad_end is None:
+            ad_end = end_boundary
+
+        print(f'Ad boundaries: {ad_start:.2f}s -> {ad_end:.2f}s ({ad_end - ad_start:.2f}s)')
+        return ad_start, ad_end

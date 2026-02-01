@@ -1,5 +1,4 @@
 import json
-import numpy as np
 from pypinyin import lazy_pinyin, Style
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -221,4 +220,4 @@ def post_process_subtitles(input_file: str, output_file: str):
     print(f'✅ Processed {len(processed)} subtitles → {output_file}')
 
 if __name__ == '__main__':
-    post_process_subtitles('subs/loves_ambition/loves_ambition_ep_9_subs_raw.json', 'subs/loves_ambition/loves_ambition_ep_9_subs_cleaned.json')
+    post_process_subtitles('subs/loves_ambition/loves_ambition_ep_18_subs_raw.json', 'subs/loves_ambition/loves_ambition_ep_18_subs_cleaned.json')

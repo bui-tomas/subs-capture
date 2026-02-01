@@ -7,3 +7,4 @@ src/utils/tester.py
 garbage.py
 .DS_Store
 __pycache__
+legacy/
